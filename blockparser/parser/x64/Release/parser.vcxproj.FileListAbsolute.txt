@@ -1,0 +1,2 @@
+E:\mydoc\_scripts\c\blockparser\x64\Release\libcrypto-3-x64.dll
+E:\mydoc\_scripts\c\blockparser\parser\x64\Release\parser.vcxproj.Up2Date
