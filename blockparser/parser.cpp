@@ -9,10 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
-#### codex/locate-files-for-blk-processing-and-validation-7l8uwa
 #include <cstring>
-###
-### master
 #include <inttypes.h>
 #include <fcntl.h>
 #include <malloc.h>
