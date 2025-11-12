@@ -1664,14 +1664,12 @@ void showScriptInfo(
     const uint8_t *indent
 ) {
 
-    uint8_t addrType[128];
     const char *typeName = "unknown";
-    uint8_t pubKeyHash[kSHA256ByteSize];
+    ScriptAddress solved;
     auto scriptType = solveOutputScript(
-        pubKeyHash,
+        solved,
         outputScript,
-        outputScriptSize,
-        addrType
+        outputScriptSize
     );
 
     switch(scriptType) {
@@ -1718,19 +1716,26 @@ void showScriptInfo(
         typeName
     );
 
-    if(0<=scriptType) {
-        uint8_t btcAddr[64];
-        hash160ToAddr(btcAddr, pubKeyHash, false, addrType[0]);
+    if(0<=scriptType && solved.valid()) {
+        auto formatted = formatAddress(solved, false);
+        if(!formatted.empty()) {
+            printf(
+                "%sscriptPaysToAddr = '%s'\n",
+                indent,
+                formatted.c_str()
+            );
+        }
+
+        const char *programLabel =
+            (solved.programLen == kRIPEMD160ByteSize && (solved.addrType & 0x80) == 0)
+                ? "scriptPaysToHash160"
+                : "scriptProgram";
         printf(
-            "%sscriptPaysToAddr = '%s'\n",
+            "%s%s = '",
             indent,
-            btcAddr
+            programLabel
         );
-        printf(
-            "%sscriptPaysToHash160 = '",
-            indent
-        );
-        showHex(pubKeyHash, kRIPEMD160ByteSize, false);
+        showHex(solved.program.data(), solved.programLen, false);
         printf("'\n");
     }
 }
