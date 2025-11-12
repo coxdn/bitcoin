@@ -58,7 +58,7 @@ struct Rewards : public Callback {
         SKIP(uint256_t, prevBlkHash, p);
         SKIP(uint256_t, blkMerkleRoot, p);
         LOAD(uint32_t, blkTime, p);
-        currBlock = b->height - 1;
+        currBlock = b->height;
         reward = 0;
     }
 
@@ -109,13 +109,11 @@ struct Rewards : public Callback {
             return;
         }
 
-        uint8_t addrType[3];
-        uint160_t pubKeyHash;
+        ScriptAddress solved;
         int type = solveOutputScript(
-            pubKeyHash.v,
+            solved,
             outputScript,
-            outputScriptSize,
-            addrType
+            outputScriptSize
         );
         if(unlikely(-2==type)) {
             return;
@@ -147,7 +145,7 @@ struct Rewards : public Callback {
             return;
         } else {
 
-            showFullAddr(pubKeyHash.v, true);
+            showFullAddr(solved, true);
             printf(" %2d ", type);
 
             // pay to hash160(pubKey)
