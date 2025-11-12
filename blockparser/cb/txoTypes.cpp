@@ -9,7 +9,7 @@
 
 struct TXOTypes:public Callback {
 
-    bool seen[10];
+    bool seen[16];
     uint64_t currBlock;
     const uint8_t *txHash;
     optparse::OptionParser parser;
@@ -66,13 +66,11 @@ struct TXOTypes:public Callback {
         const uint8_t *outputScript,        // Raw script (challenge to would-be spender) carried by this output
         uint64_t      outputScriptSize      // Byte size of raw script
     ) {
-        uint160_t hash;
-        uint8_t addrType[3];
+        ScriptAddress solved;
         auto r = solveOutputScript(
-            hash.v,
+            solved,
             outputScript,
-            outputScriptSize,
-            addrType
+            outputScriptSize
         );
 
         auto doPrint = true;

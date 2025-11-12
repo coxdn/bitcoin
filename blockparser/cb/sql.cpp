@@ -7,6 +7,7 @@
 #include <errlog.h>
 #include <option.h>
 #include <callback.h>
+#include <string>
 
 static uint8_t empty[kSHA256ByteSize] = { 0x42 };
 
@@ -117,7 +118,7 @@ struct SQLDump : public Callback {
             "\n"
             "CREATE TABLE outputs(\n"
             "    id BIGINT PRIMARY KEY,\n"
-            "    dstAddress CHAR(36),\n"
+            "    dstAddress VARCHAR(90),\n"
             "    value BIGINT,\n"
             "    txID BIGINT,\n"
             "    offset INT\n"
@@ -182,7 +183,7 @@ struct SQLDump : public Callback {
         // id BIGINT PRIMARY KEY
         // hash BINARY(32)
         // time BIGINT
-        fprintf(blockFile, "%" PRIu64 "\t", (blkID = b->height-1));
+        fprintf(blockFile, "%" PRIu64 "\t", (blkID = b->height));
 
         writeEscapedBinaryBufferRev(blockFile, blockHash, kSHA256ByteSize);
         fputc('\t', blockFile);
@@ -222,29 +223,20 @@ struct SQLDump : public Callback {
         const uint8_t *outputScript,
         uint64_t      outputScriptSize
     ) {
-        uint8_t address[40];
-        address[0] = 'X';
-        address[1] = 0;
-
-        uint8_t addrType[3];
-        uint160_t pubKeyHash;
+        ScriptAddress solved;
         int type = solveOutputScript(
-            pubKeyHash.v,
+            solved,
             outputScript,
-            outputScriptSize,
-            addrType
+            outputScriptSize
         );
-        if(likely(0<=type)) {
-            hash160ToAddr(
-                address,
-                pubKeyHash.v,
-                false,
-                addrType[0]
-            );
+
+        std::string address;
+        if(0<=type) {
+            address = formatAddress(solved, false);
         }
 
         // id BIGINT PRIMARY KEY
-        // dstAddress CHAR(36)
+        // dstAddress VARCHAR(90)
         // value BIGINT
         // txID BIGINT
         // offset INT
@@ -257,7 +249,7 @@ struct SQLDump : public Callback {
             "%" PRIu32 "\n"
             ,
             outputID,
-            address,
+            address.empty() ? "" : address.c_str(),
             value,
             txID,
             (uint32_t)outputIndex

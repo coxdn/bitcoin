@@ -7,6 +7,9 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cstdio>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <malloc.h>
 #include <stdlib.h>
@@ -14,6 +17,7 @@
 #include <limits>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <boost/multiprecision/cpp_int.hpp>
 
 #if defined(_WIN32) || defined(_WIN64)
     #ifndef O_BINARY
@@ -58,10 +62,33 @@ static uint8_t empty[kSHA256ByteSize] = { 0x42 };
 static Block *gMaxBlock;
 static Block *gNullBlock;
 static int64_t gMaxHeight;
+static ChainWork gMaxChainWork;
 static uint64_t gChainSize;
 static uint256_t gNullHash;
 static int64_t gTimeLimit = -1;
 static bool gUseTimeLimit = false;
+static size_t gRejectedBasicHeaders = 0;
+static size_t gRejectedContextHeaders = 0;
+static size_t gRejectedVersionHeaders = 0;
+
+static constexpr int64_t kMaxFutureBlockDrift = 2 * 60 * 60;
+
+#if defined(BITCOIN)
+    static constexpr int32_t kBip34Height = 227931;
+    static constexpr int32_t kBip65Height = 388381;
+    static constexpr int32_t kBip66Height = 363725;
+    static const char *kConsensusPowLimitHex = "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+#elif defined(TESTNET3)
+    static constexpr int32_t kBip34Height = 21111;
+    static constexpr int32_t kBip65Height = 581885;
+    static constexpr int32_t kBip66Height = 330776;
+    static const char *kConsensusPowLimitHex = "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+#else
+    static constexpr int32_t kBip34Height = std::numeric_limits<int32_t>::max();
+    static constexpr int32_t kBip65Height = std::numeric_limits<int32_t>::max();
+    static constexpr int32_t kBip66Height = std::numeric_limits<int32_t>::max();
+    static const char *kConsensusPowLimitHex = 0;
+#endif
 
 static double getMem() {
 
@@ -198,6 +225,356 @@ static inline void endOutput(
         outputScript,
         outputScriptSize
     );
+}
+
+using boost::multiprecision::cpp_int;
+
+static cpp_int powLimitFromHex(const char *hex) {
+    cpp_int value = 0;
+    if(0 == hex) {
+        return value;
+    }
+    while(*hex) {
+        char c = *hex++;
+        int nibble = -1;
+        if('0'<=c && c<='9') {
+            nibble = c - '0';
+        } else if('a'<=c && c<='f') {
+            nibble = 10 + (c - 'a');
+        } else if('A'<=c && c<='F') {
+            nibble = 10 + (c - 'A');
+        } else {
+            continue;
+        }
+        value <<= 4;
+        value += nibble;
+    }
+    return value;
+}
+
+static const cpp_int &GetConsensusPowLimit() {
+    static const cpp_int powLimit = powLimitFromHex(kConsensusPowLimitHex);
+    return powLimit;
+}
+
+static cpp_int hashToCppInt(const uint8_t *hash) {
+    cpp_int value = 0;
+    for(int i = kSHA256ByteSize - 1; i >= 0; --i) {
+        value <<= 8;
+        value += hash[i];
+    }
+    return value;
+}
+
+static bool decodeCompactBits(uint32_t bits, cpp_int &target) {
+    target = 0;
+    if(bits & 0x00800000U) {
+        return false;
+    }
+
+    uint32_t mantissa = bits & 0x007fffffU;
+    if(mantissa == 0) {
+        return false;
+    }
+
+    int exponent = bits >> 24;
+    if(exponent <= 0) {
+        return false;
+    }
+
+    target = mantissa;
+    if(exponent <= 3) {
+        target >>= 8 * (3 - exponent);
+    } else {
+        target <<= 8 * (exponent - 3);
+    }
+    return true;
+}
+
+static bool checkProofOfWork(const Block *block) {
+    cpp_int target;
+    if(!decodeCompactBits(block->bits, target)) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s has invalid compact target encoding (bits=%08" PRIx32 ")",
+            hashHex,
+            block->bits
+        );
+        return false;
+    }
+
+    if(target <= 0) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning("block %s encodes non-positive work target", hashHex);
+        return false;
+    }
+
+    if(0 != kConsensusPowLimitHex) {
+        const cpp_int &powLimit = GetConsensusPowLimit();
+        if(powLimit != 0 && target > powLimit) {
+            uint8_t hashHex[2*kSHA256ByteSize + 1];
+            toHex(hashHex, block->hash);
+            warning(
+                "block %s target exceeds consensus limit", hashHex
+            );
+            return false;
+        }
+    }
+
+    cpp_int hashValue = hashToCppInt(block->hash);
+    if(hashValue > target) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s fails proof-of-work check", hashHex
+        );
+        return false;
+    }
+
+    return true;
+}
+
+static bool checkBlockTime(const Block *block) {
+    time_t now = time(0);
+    if(now < 0) {
+        now = 0;
+    }
+    int64_t limit = static_cast<int64_t>(now) + kMaxFutureBlockDrift;
+    if(static_cast<int64_t>(block->time) > limit) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s timestamp %" PRIu32 " exceeds allowable future drift",
+            hashHex,
+            block->time
+        );
+        return false;
+    }
+    return true;
+}
+
+static bool validateBlockHeaderBasics(Block *block) {
+    if(!checkProofOfWork(block)) {
+        ++gRejectedBasicHeaders;
+        return false;
+    }
+    if(!checkBlockTime(block)) {
+        ++gRejectedBasicHeaders;
+        return false;
+    }
+    block->headerValidated = true;
+    return true;
+}
+
+static uint32_t computeMedianTimePast(const Block *parent) {
+    std::vector<uint32_t> samples;
+    samples.reserve(11);
+    const Block *cursor = parent;
+    while(cursor && cursor != gNullBlock && samples.size() < 11) {
+        samples.push_back(cursor->time);
+        cursor = cursor->prev;
+    }
+    if(samples.empty()) {
+        return 0;
+    }
+    std::vector<uint32_t> ordered = samples;
+    size_t mid = ordered.size() / 2;
+    std::nth_element(ordered.begin(), ordered.begin() + mid, ordered.end());
+    return ordered[mid];
+}
+
+static bool validateContextualBlockHeader(
+    const Block *block,
+    const Block *parent,
+    bool        &missingContext,
+    bool         logFailures
+) {
+    missingContext = false;
+    if(0==parent) {
+        missingContext = true;
+        return false;
+    }
+    if(parent->invalid || !parent->headerValidated) {
+        if(logFailures) {
+            uint8_t childHex[2*kSHA256ByteSize + 1];
+            toHex(childHex, block->hash);
+            uint8_t parentHex[2*kSHA256ByteSize + 1];
+            toHex(parentHex, parent->hash);
+            warning(
+                "block %s references invalid or unchecked parent %s",
+                childHex,
+                parentHex
+            );
+        }
+        ++gRejectedContextHeaders;
+        return false;
+    }
+
+    uint32_t median = computeMedianTimePast(parent);
+    if(median != 0 && block->time <= median) {
+        if(logFailures) {
+            uint8_t hashHex[2*kSHA256ByteSize + 1];
+            toHex(hashHex, block->hash);
+            warning(
+                "block %s timestamp %" PRIu32 " is not greater than median past %" PRIu32,
+                hashHex,
+                block->time,
+                median
+            );
+        }
+        ++gRejectedContextHeaders;
+        return false;
+    }
+
+    return true;
+}
+
+static bool checkVersionForHeight(const Block *block, int64_t height) {
+    if(height >= kBip34Height && block->version < 2) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s at height %" PRId64 " has version %" PRId32 " below BIP34 minimum",
+            hashHex,
+            height,
+            block->version
+        );
+        ++gRejectedVersionHeaders;
+        return false;
+    }
+    if(height >= kBip66Height && block->version < 3) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s at height %" PRId64 " has version %" PRId32 " below BIP66 minimum",
+            hashHex,
+            height,
+            block->version
+        );
+        ++gRejectedVersionHeaders;
+        return false;
+    }
+    if(height >= kBip65Height && block->version < 4) {
+        uint8_t hashHex[2*kSHA256ByteSize + 1];
+        toHex(hashHex, block->hash);
+        warning(
+            "block %s at height %" PRId64 " has version %" PRId32 " below BIP65 minimum",
+            hashHex,
+            height,
+            block->version
+        );
+        ++gRejectedVersionHeaders;
+        return false;
+    }
+    return true;
+}
+
+static ChainWork makeZeroChainWork() {
+    ChainWork work;
+    for(int i = 0; i < 4; ++i) {
+        work.words[i] = 0;
+    }
+    return work;
+}
+
+static ChainWork chainWorkFromCppInt(const cpp_int &value) {
+    ChainWork work = makeZeroChainWork();
+    cpp_int tmp = value;
+    for(int i = 0; i < 4; ++i) {
+        work.words[i] = static_cast<uint64_t>(tmp & 0xffffffffffffffffULL);
+        tmp >>= 64;
+    }
+    return work;
+}
+
+static inline void chainWorkAdd(ChainWork &accumulator, const ChainWork &value) {
+    uint64_t carry = 0;
+    for(int i = 0; i < 4; ++i) {
+        uint64_t current = accumulator.words[i];
+        uint64_t addend = value.words[i];
+        uint64_t sum = current + addend;
+        uint64_t result = sum + carry;
+        uint64_t newCarry = 0;
+        if(sum < current) {
+            newCarry = 1;
+        }
+        if(result < sum) {
+            ++newCarry;
+        }
+        accumulator.words[i] = result;
+        carry = newCarry;
+    }
+}
+
+static inline int chainWorkCompare(const ChainWork &a, const ChainWork &b) {
+    for(int i = 3; i >= 0; --i) {
+        if(a.words[i] < b.words[i]) {
+            return -1;
+        }
+        if(a.words[i] > b.words[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void chainWorkToHex(const ChainWork &work, char *out, size_t outSize) {
+    if(outSize < 65) {
+        if(outSize > 0) {
+            out[0] = 0;
+        }
+        return;
+    }
+    char *cursor = out;
+    for(int i = 3; i >= 0; --i) {
+        size_t consumed = static_cast<size_t>(cursor - out);
+        size_t remaining = outSize - consumed;
+        int written = snprintf(cursor, remaining, "%016" PRIx64, work.words[i]);
+        if(written < 0) {
+            out[0] = 0;
+            return;
+        }
+        cursor += written;
+    }
+    out[64] = 0;
+}
+
+static ChainWork computeBlockProof(uint32_t bits) {
+    if(bits & 0x00800000U) {
+        return makeZeroChainWork();
+    }
+
+    uint32_t mantissa = bits & 0x007fffffU;
+    if(mantissa == 0) {
+        return makeZeroChainWork();
+    }
+
+    int exponent = bits >> 24;
+    cpp_int target = mantissa;
+    if(exponent <= 3) {
+        target >>= 8 * (3 - exponent);
+    } else {
+        target <<= 8 * (exponent - 3);
+    }
+
+    if(target <= 0) {
+        return makeZeroChainWork();
+    }
+
+    const cpp_int maxValue = (cpp_int(1) << 256) - 1;
+    if(target > maxValue) {
+        return makeZeroChainWork();
+    }
+
+    cpp_int denominator = target + 1;
+    cpp_int numerator = maxValue - target;
+    cpp_int proof = (numerator / denominator) + 1;
+    if(proof < 0) {
+        return makeZeroChainWork();
+    }
+    return chainWorkFromCppInt(proof);
 }
 
 static inline void edge(
@@ -527,11 +904,17 @@ static void parseLongestChain() {
                 auto bytesLeft = gChainSize - bytesSoFar;
                 auto secsLeft = bytesLeft / bytesPerSec;
                 if((1.0 * 1000 * 1000)<elapsedSinceLastTime) {
+                    char currentWork[65];
+                    char tipWork[65];
+                    chainWorkToHex(blk->chainWork, currentWork, sizeof(currentWork));
+                    chainWorkToHex(gMaxChainWork, tipWork, sizeof(tipWork));
                     fprintf(
                         stderr,
-                        "block %6d/%6d, %.2f%% done, ETA = %.2fsecs, mem = %.3f Gig           \r",
+                        "block %6d/%6d (work 0x%s/0x%s), %.2f%% done, ETA = %.2fsecs, mem = %.3f Gig           \r",
                         (int)blk->height,
                         (int)gMaxHeight,
+                        currentWork,
+                        tipWork,
                         progress*100.0,
                         secsLeft,
                         getMem()
@@ -569,9 +952,12 @@ static void wireLongestChain() {
         block = prev;
     }
 
+    char workHex[65];
+    chainWorkToHex(gMaxChainWork, workHex, sizeof(workHex));
     info(
-        "pass 3 -- done, maxHeight=%d",
-        (int)gMaxHeight
+        "pass 3 -- done, bestHeight=%d, chainWork=0x%s",
+        (int)gMaxHeight,
+        workHex
     );
 }
 
@@ -614,6 +1000,12 @@ static void initCallback(
 static void findBlockParent(
     Block *b
 ) {
+    if(unlikely(0==b || b->invalid || !b->headerValidated)) {
+        return;
+    }
+
+    b->prev = 0;
+
     auto where = lseek64(
         b->chunk->getBlockFile()->fd,
         b->chunk->getOffset(),
@@ -659,7 +1051,19 @@ static void findBlockParent(
         );
         return;
     }
-    b->prev = i->second;
+
+    Block *candidate = i->second;
+    bool missingContext = false;
+    if(!validateContextualBlockHeader(b, candidate, missingContext, true)) {
+        if(missingContext) {
+            return;
+        }
+        b->invalid = true;
+        return;
+    }
+
+    b->prev = candidate;
+    b->contextValidated = true;
 }
 
 static void computeBlockHeight(
@@ -671,8 +1075,20 @@ static void computeBlockHeight(
         return;
     }
 
+    if(block->invalid || !block->headerValidated) {
+        return;
+    }
+
+    if(block->height>=0) {
+        return;
+    }
+
     auto b = block;
-    while(b->height<0) {
+    while(b->height<0 && gNullBlock!=b) {
+
+        if(b->invalid || !b->headerValidated) {
+            return;
+        }
 
         if(unlikely(0==b->prev)) {
 
@@ -685,6 +1101,34 @@ static void computeBlockHeight(
             }
         }
 
+        if(unlikely(b->prev->invalid || !b->prev->headerValidated)) {
+
+            uint8_t childHex[2*kSHA256ByteSize + 1];
+            toHex(childHex, b->hash);
+
+            uint8_t parentHex[2*kSHA256ByteSize + 1];
+            toHex(parentHex, b->prev->hash);
+
+            warning(
+                "block %s references invalid parent %s",
+                childHex,
+                parentHex
+            );
+            b->invalid = true;
+            return;
+        }
+
+        if(!b->contextValidated) {
+            bool missingContext = false;
+            if(!validateContextualBlockHeader(b, b->prev, missingContext, true)) {
+                if(!missingContext) {
+                    b->invalid = true;
+                }
+                return;
+            }
+            b->contextValidated = true;
+        }
+
         b->prev->next = b;
         b = b->prev;
     }
@@ -692,34 +1136,94 @@ static void computeBlockHeight(
     auto height = b->height;
     while(1) {
 
-        b->height = height++;
+        auto next = b->next;
+        b->next = 0;
 
-        if(likely(gMaxHeight<b->height)) {
+        if(unlikely(0==next)) {
+            break;
+        }
+
+        b = next;
+
+        if(b->invalid || !b->headerValidated) {
+            continue;
+        }
+
+        if(unlikely(0==b->prev)) {
+            continue;
+        }
+
+        if(unlikely(b->prev->invalid || b->prev->height<0)) {
+            if(b->prev->invalid) {
+                b->invalid = true;
+                continue;
+            }
+            computeBlockHeight(b->prev, lateLinks);
+            if(b->prev->height<0) {
+                continue;
+            }
+        }
+
+        height = b->prev->height;
+        b->height = height + 1;
+
+        if(!b->contextValidated) {
+            bool missingContext = false;
+            if(!validateContextualBlockHeader(b, b->prev, missingContext, true)) {
+                if(!missingContext) {
+                    b->invalid = true;
+                }
+                b->height = -1;
+                continue;
+            }
+            b->contextValidated = true;
+        }
+
+        if(!checkVersionForHeight(b, b->height)) {
+            b->invalid = true;
+            b->height = -1;
+            continue;
+        }
+        b->versionValidated = true;
+
+        ChainWork proof = computeBlockProof(b->bits);
+        if(likely(0!=b->prev)) {
+            b->chainWork = b->prev->chainWork;
+            chainWorkAdd(b->chainWork, proof);
+        } else {
+            b->chainWork = proof;
+        }
+
+        int cmp = chainWorkCompare(gMaxChainWork, b->chainWork);
+        if(likely(cmp < 0 || (0==cmp && gMaxHeight < b->height))) {
+            gMaxChainWork = b->chainWork;
             gMaxHeight = b->height;
             gMaxBlock = b;
         }
 
-        auto next = b->next;
-        b->next = 0;
-
         if(block==b) {
             break;
         }
-        b = next;
     }
 }
 
 static void computeBlockHeights() {
 
     size_t lateLinks = 0;
+    size_t initialContextRejects = gRejectedContextHeaders;
+    size_t initialVersionRejects = gRejectedVersionHeaders;
     info("pass 2 -- link all blocks ...");
     for(const auto &pair:gBlockMap) {
         computeBlockHeight(pair.second, lateLinks);
     }
+    size_t pass2ContextRejects = gRejectedContextHeaders - initialContextRejects;
+    size_t pass2VersionRejects = gRejectedVersionHeaders - initialVersionRejects;
     info(
-        "pass 2 -- done, did %d late links",
-        (int)lateLinks
-    ); 
+        "pass 2 -- done, did %d late links, %zu contextual rejects, %zu version rejects",
+        (int)lateLinks,
+        pass2ContextRejects,
+        pass2VersionRejects
+    );
 }
 
 static void getBlockHeader(
@@ -822,6 +1326,9 @@ static void buildBlockHeaders() {
             const uint8_t *timePtr = buf + 8 + 4 + 32 + 32;
             LOAD(uint32_t, rawTime, timePtr);
             uint32_t blockTime = rawTime;
+            const uint8_t *bitsPtr = timePtr + 4;
+            uint32_t blockBits = 0;
+            LOAD(uint32_t, blockBits, bitsPtr);
 
             if(gUseTimeLimit && ((int64_t)blockTime > gTimeLimit)) {
                 auto cur = lseek(blockFile.fd, 0, SEEK_CUR);
@@ -841,6 +1348,9 @@ static void buildBlockHeaders() {
 
             startBlock((uint8_t*)0);
 
+            const uint8_t *versionPtr = buf + 8;
+            LOAD(int32_t, blockVersion, versionPtr);
+
             uint8_t *hash = 0;
             Block *prevBlock = 0;
             size_t blockSize = 0;
@@ -853,18 +1363,41 @@ static void buildBlockHeaders() {
                 buf
             );
             if(unlikely(0==hash)) {
+                endBlock((uint8_t*)0);
                 break;
             }
 
             auto where = lseek(blockFile.fd, (blockSize + 8) - sz, SEEK_CUR);
             if(where<0) {
+                endBlock((uint8_t*)0);
                 break;
             }
             auto blockOffset = where - blockSize;
             fileBytesRead = (uint64_t)where;
 
             auto block = Block::alloc();
-            block->init(hash, &blockFile, blockSize, prevBlock, blockOffset, blockTime);
+            block->init(hash, &blockFile, blockSize, 0, blockOffset, blockTime, blockBits, blockVersion);
+
+            if(!validateBlockHeaderBasics(block)) {
+                endBlock((uint8_t*)0);
+                continue;
+            }
+
+            Block *candidatePrev = prevBlock;
+            if(candidatePrev) {
+                bool missingContext = false;
+                if(validateContextualBlockHeader(block, candidatePrev, missingContext, true)) {
+                    block->prev = candidatePrev;
+                    block->contextValidated = true;
+                } else if(missingContext) {
+                    block->prev = 0;
+                } else {
+                    block->invalid = true;
+                    endBlock((uint8_t*)0);
+                    continue;
+                }
+            }
+
             gBlockMap[hash] = block;
             endBlock((uint8_t*)0);
             ++nbBlocks;
@@ -917,10 +1450,30 @@ static void buildBlockHeaders() {
 
     gChainSize = effectiveSize;
 
-    char msg[128];
+    char msg[256];
     msg[0] = 0;
+    size_t msgLen = 0;
     if(0<earlyMissCnt) {
-        sprintf(msg, ", %d early link misses", (int)earlyMissCnt);
+        int written = snprintf(
+            msg + msgLen,
+            sizeof(msg) - msgLen,
+            ", %d early link misses",
+            (int)earlyMissCnt
+        );
+        if(written > 0) {
+            msgLen += (size_t)written;
+        }
+    }
+    if(gRejectedBasicHeaders>0) {
+        int written = snprintf(
+            msg + msgLen,
+            sizeof(msg) - msgLen,
+            ", filtered %zu invalid headers",
+            gRejectedBasicHeaders
+        );
+        if(written > 0) {
+            msgLen += (size_t)written;
+        }
     }
 
     auto elapsed = 1e-6*(Timer::usecs() - startTime);
@@ -937,8 +1490,15 @@ static void buildBlockHeaders() {
 
 static void buildNullBlock() {
     gBlockMap[gNullHash.v] = gNullBlock = Block::alloc();
-    gNullBlock->init(gNullHash.v, 0, 0, 0, 0, 0);
-    gNullBlock->height = 0;
+    gNullBlock->init(gNullHash.v, 0, 0, 0, 0, 0, 0, 0);
+    gNullBlock->headerValidated = true;
+    gNullBlock->contextValidated = true;
+    gNullBlock->versionValidated = true;
+    gNullBlock->invalid = false;
+    gNullBlock->height = -1;
+    gMaxBlock = gNullBlock;
+    gMaxHeight = gNullBlock->height;
+    gMaxChainWork = gNullBlock->chainWork;
 }
 
 static void initHashtables() {

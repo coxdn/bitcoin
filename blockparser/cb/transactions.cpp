@@ -11,8 +11,9 @@
 #include <string.h>
 #include <callback.h>
 
-static uint8_t emptyKey[kRIPEMD160ByteSize] = { 0x52 };
-typedef GoogMap<Hash160, int, Hash160Hasher, Hash160Equal>::Map AddrMap;
+#include <unordered_map>
+
+typedef std::unordered_map<ScriptAddressKey, int, ScriptAddressKeyHasher> AddrMap;
 
 struct Transactions:public Callback
 {
@@ -25,7 +26,7 @@ struct Transactions:public Callback
     uint64_t nbTX;
     uint64_t bTime;
     AddrMap addrMap;
-    std::vector<uint160_t> rootHashes;
+    std::vector<ScriptAddressKey> rootHashes;
 
     Transactions()
     {
@@ -81,10 +82,10 @@ struct Transactions:public Callback
 
         auto e = rootHashes.end();
         auto i = rootHashes.begin();
-        addrMap.setEmptyKey(emptyKey);
+        addrMap.reserve(rootHashes.size());
         while(e!=i) {
-            const uint160_t &h = *(i++);
-            addrMap[h.v] = 1;
+            const ScriptAddressKey &h = *(i++);
+            addrMap[h] = 1;
         }
         return 0;
     }
@@ -98,29 +99,26 @@ struct Transactions:public Callback
         const uint8_t *downTXHash = 0
     )
     {
-        uint8_t addrType[3];
-        uint160_t pubKeyHash;
+        ScriptAddress solved;
         auto scriptType = solveOutputScript(
-            pubKeyHash.v,
+            solved,
             script,
-            scriptSize,
-            addrType
+            scriptSize
         );
         if(unlikely(scriptType<0)) {
             return;
         }
 
-        uint8_t addrBuf[64];
-        hash160ToAddr(addrBuf, pubKeyHash.v, true, addrType[0]);
+        auto key = makeScriptAddressKey(solved);
 
-        bool match = (addrMap.end() != addrMap.find(pubKeyHash.v));
+        bool match = (addrMap.end() != addrMap.find(key));
         if(unlikely(match)) {
 
             int64_t newSum = sum + value*(add ? 1 : -1);
 
             if(csv) {
                 printf("%6" PRIu64 ", \"", bTime/86400 + 25569);
-                showHex(pubKeyHash.v, kRIPEMD160ByteSize, false);
+                showHex(solved.program.data(), solved.programLen, false);
                 printf("\", \"");
                 showHex(downTXHash ? downTXHash : txHash);
                 printf(
@@ -141,8 +139,9 @@ struct Transactions:public Callback
                 if(0<sz) timeBuf[sz-1] = 0;
 
                 printf("    %s    ", timeBuf);
-                showHex(pubKeyHash.v, kRIPEMD160ByteSize, false);
-                printf(" (%s)", addrBuf);
+                showHex(solved.program.data(), solved.programLen, false);
+                auto formatted = formatAddress(solved, false);
+                printf(" (%s)", formatted.c_str());
 
                 printf("    ");
                 showHex(downTXHash ? downTXHash : txHash);

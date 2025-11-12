@@ -11,18 +11,11 @@
 
 #include <vector>
 #include <string.h>
+#include <unordered_map>
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/connected_components.hpp>
 
-typedef uint160_t Addr;
-static uint8_t gEmptyKey[kRIPEMD160ByteSize] = { 0x52 };
-
-typedef GoogMap<
-    Hash160,
-    uint64_t,
-    Hash160Hasher,
-    Hash160Equal
->::Map AddrMap;
+typedef std::unordered_map<ScriptAddressKey, uint64_t, ScriptAddressKeyHasher> AddrMap;
 
 typedef boost::adjacency_list<
     boost::vecS,
@@ -37,9 +30,9 @@ struct Closure : public Callback {
     Graph graph;
     AddrMap addrMap;
     double startTime;
-    std::vector<Addr*> allAddrs;
+    std::vector<ScriptAddress> allAddrs;
     std::vector<uint64_t> vertices;
-    std::vector<uint160_t> rootHashes;
+    std::vector<ScriptAddressKey> rootHashes;
 
     Closure() {
         parser
@@ -77,8 +70,7 @@ struct Closure : public Callback {
             loadKeyList(rootHashes, addr);
         }
 
-        addrMap.setEmptyKey(gEmptyKey);
-        addrMap.resize(15 * 1000 * 1000);
+        addrMap.reserve(15 * 1000 * 1000);
         allAddrs.reserve(15 * 1000 * 1000);
         info("Building address equivalence graph ...");
         startTime = Timer::usecs();
@@ -96,20 +88,19 @@ struct Closure : public Callback {
         const uint8_t *inputScript,
         uint64_t      inputScriptSize
     ) {
-        uint8_t addrType[3];
-        uint160_t pubKeyHash;
-        int type = solveOutputScript(pubKeyHash.v, outputScript, outputScriptSize, addrType);
+        ScriptAddress solved;
+        int type = solveOutputScript(solved, outputScript, outputScriptSize);
         if(unlikely(type<0)) return;
 
         uint64_t a;
-        auto i = addrMap.find(pubKeyHash.v);
+        auto key = makeScriptAddressKey(solved);
+        auto i = addrMap.find(key);
         if(unlikely(addrMap.end()!=i))
             a = i->second;
         else {
-            Addr *addr = (Addr*)allocHash160();
-            memcpy(addr->v, pubKeyHash.v, kRIPEMD160ByteSize);
-            addrMap[addr->v] = a = allAddrs.size();
-            allAddrs.push_back(addr);
+            a = allAddrs.size();
+            allAddrs.push_back(solved);
+            addrMap[key] = a;
         }
 
         vertices.push_back(a);
@@ -139,16 +130,16 @@ struct Closure : public Callback {
         while(e!=i) {
 
             uint64_t count = 0;
-            const uint8_t *keyHash = (i++)->v;
+            ScriptAddressKey key = *(i++);
+            ScriptAddress addrKey = scriptAddressFromKey(key);
 
-            uint8_t b58[128];
-            hash160ToAddr(b58, keyHash);
-            info("Address cluster for address %s:", b58);
+            auto human = formatAddress(addrKey, false);
+            info("Address cluster for address %s:", human.c_str());
 
-            auto j = addrMap.find(keyHash);
+            auto j = addrMap.find(key);
             if(unlikely(addrMap.end()==j)) {
                 warning("specified key was never used to spend coins");
-                showFullAddr(keyHash);
+                showFullAddr(addrKey);
                 printf("\n");
                 count = 1;
             } else {
@@ -157,8 +148,8 @@ struct Closure : public Callback {
                 for(size_t k=0; likely(k<cc.size()); ++k) {
                     uint64_t componentIndex = cc[k];
                     if(unlikely(homeComponentIndex==componentIndex)) {
-                        Addr *addr = allAddrs[k];
-                        showFullAddr(addr->v);
+                        const ScriptAddress &addr = allAddrs[k];
+                        showFullAddr(addr);
                         printf("\n");
                         ++count;
                     }

@@ -16,13 +16,13 @@
 #include <algorithm>
 #include <time.h>
 #include <stdio.h>
+#include <unordered_map>
 
 struct Addr;
 struct AllBalances;
 AllBalances *theObject;
-static uint8_t emptyKey[kSHA256ByteSize] = { 0x52 };
-typedef GoogMap<Hash160, Addr*, Hash160Hasher, Hash160Equal>::Map AddrMap;
-typedef GoogMap<Hash160, int, Hash160Hasher, Hash160Equal>::Map RestrictMap;
+typedef std::unordered_map<ScriptAddressKey, Addr*, ScriptAddressKeyHasher> AddrMap;
+typedef std::unordered_map<ScriptAddressKey, int, ScriptAddressKeyHasher> RestrictMap;
 
 struct Output {
     int64_t time;
@@ -35,11 +35,11 @@ struct Output {
 typedef std::vector<Output> OutputVec;
 
 struct Addr {
-    uint8_t type;
+    ScriptAddress address;
+    ScriptAddressKey key;
     uint64_t sum;
     uint64_t nbIn;
     uint64_t nbOut;
-    uint160_t hash;
     uint32_t lastIn;
     uint32_t lastOut;
     OutputVec *outputVec;
@@ -90,7 +90,7 @@ struct AllBalances:public Callback {
     const Block *firstBlock;
     RestrictMap restrictMap;
     std::vector<Addr*> allAddrs;
-    std::vector<uint160_t> restricts;
+    std::vector<ScriptAddressKey> restricts;
 
     AllBalances()
     {
@@ -193,8 +193,7 @@ struct AllBalances:public Callback {
         lastBlock = 0;
         firstBlock = 0;
 
-        addrMap.setEmptyKey(emptyKey);
-        addrMap.resize(15 * 1000 * 1000);
+        addrMap.reserve(15 * 1000 * 1000);
         allAddrs.reserve(15 * 1000 * 1000);
 
         useTimeSnapshots = false;
@@ -254,10 +253,10 @@ struct AllBalances:public Callback {
 
             auto e = restricts.end();
             auto i = restricts.begin();
-            restrictMap.setEmptyKey(emptyKey);
+            restrictMap.reserve(restricts.size());
             while(e!=i) {
-                const uint160_t &h = *(i++);
-                restrictMap[h.v] = 1;
+                const ScriptAddressKey &h = *(i++);
+                restrictMap[h] = 1;
             }
         } else {
             if(detailed && 50000<cutoffBlock) {
@@ -384,35 +383,35 @@ struct AllBalances:public Callback {
             return;
         }
 
-        uint8_t addrType[3];
-        uint160_t pubKeyHash;
+        ScriptAddress solved;
         auto scriptType = solveOutputScript(
-            pubKeyHash.v,
+            solved,
             script,
-            scriptSize,
-            addrType
+            scriptSize
         );
         if(unlikely(scriptType<0)) {
             return;
         }
 
+        auto key = makeScriptAddressKey(solved);
+
         if(0!=restrictMap.size()) {
-            auto r = restrictMap.find(pubKeyHash.v);
+            auto r = restrictMap.find(key);
             if(restrictMap.end()==r) {
                 return;
             }
         }
 
         Addr *addr;
-        auto i = addrMap.find(pubKeyHash.v);
+        auto i = addrMap.find(key);
         if(unlikely(addrMap.end()!=i)) {
             addr = i->second;
         } else {
 
             addr = allocAddr();
 
-            memcpy(addr->hash.v, pubKeyHash.v, kRIPEMD160ByteSize);
-            addr->type = addrType[0];
+            addr->address = solved;
+            addr->key = key;
             addr->outputVec = 0;
             addr->nbOut = 0;
             addr->nbIn = 0;
@@ -423,7 +422,7 @@ struct AllBalances:public Callback {
                 addr->outputVec = new OutputVec;
             }
 
-            addrMap[addr->hash.v] = addr;
+            addrMap[key] = addr;
             allAddrs.push_back(addr);
         }
 
@@ -571,7 +570,7 @@ struct AllBalances:public Callback {
 
             Addr *addr = *(s++);
             if(0!=nbRestricts) {
-                auto r = restrictMap.find(addr->hash.v);
+                auto r = restrictMap.find(addr->key);
                 if(restrictMap.end()==r) continue;
             }
 
@@ -582,12 +581,12 @@ struct AllBalances:public Callback {
             }
 
             if(csv) {
-                printEscapedBinaryBuffer(addr->hash.v, kRIPEMD160ByteSize);
+                printEscapedBinaryBuffer(addr->address.program.data(), addr->address.programLen);
                 putchar('\t');
             } else {
                 showHex(
-                    addr->hash.v,
-                    kRIPEMD160ByteSize,
+                    addr->address.program.data(),
+                    addr->address.programLen,
                     false
                 );
             }
@@ -605,12 +604,15 @@ struct AllBalances:public Callback {
                     addr->lastOut
                 );
             } else {
+                auto formatted = formatAddress(addr->address, true);
                 if(i<showAddr || 0!=nbRestricts) {
-                    uint8_t buf[64];
-                    hash160ToAddr(buf, addr->hash.v, true, addr->type);
-                    printf(" %s", buf);
+                    printf(" %s", formatted.c_str());
                 } else {
-                    printf(" XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+                    std::string mask(formatted.empty() ? 34 : formatted.size(), 'X');
+                    if(mask.empty()) {
+                        mask.assign(34, 'X');
+                    }
+                    printf(" %s", mask.c_str());
                 }
 
                 char timeBuf[256];
