@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <algorithm>
+#include <ctype.h>
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
 #include <openssl/obj_mac.h>
@@ -39,6 +40,42 @@ template<> uint8_t *PagedAllocator<uint160_t>::poolEnd = 0;
 
 template<> uint8_t *PagedAllocator<Chunk>::pool = 0;
 template<> uint8_t *PagedAllocator<Chunk>::poolEnd = 0;
+
+size_t ScriptAddressKeyHasher::operator()(const ScriptAddressKey &key) const
+{
+    uint64_t hash = (uint64_t)key.type;
+    hash = (hash << 8) ^ key.addrType;
+    hash = (hash << 8) ^ key.programLen;
+    for(uint8_t i = 0; i < key.programLen; ++i) {
+        hash = (hash * 1315423911u) ^ key.program[i];
+    }
+    return (size_t)hash;
+}
+
+ScriptAddressKey makeScriptAddressKey(const ScriptAddress &addr)
+{
+    ScriptAddressKey key;
+    key.type = (addr.type < 0) ? 0xff : (uint8_t)addr.type;
+    key.addrType = addr.addrType;
+    key.programLen = addr.programLen;
+    key.program.fill(0);
+    for(uint8_t i = 0; i < addr.programLen && i < key.program.size(); ++i) {
+        key.program[i] = addr.program[i];
+    }
+    return key;
+}
+
+ScriptAddress scriptAddressFromKey(const ScriptAddressKey &key)
+{
+    ScriptAddress addr;
+    addr.type = (key.type == 0xff) ? -1 : key.type;
+    addr.addrType = key.addrType;
+    addr.programLen = key.programLen;
+    for(uint8_t i = 0; i < key.programLen && i < addr.program.size(); ++i) {
+        addr.program[i] = key.program[i];
+    }
+    return addr;
+}
 
 time_t timegmCompat(struct tm *utc)
 {
@@ -421,13 +458,15 @@ bool decompressPublicKey(
 }
 
 int solveOutputScript(
-          uint8_t *pubKeyHash,
+    ScriptAddress &addr,
     const uint8_t *script,
-    uint64_t      scriptSize,
-    uint8_t       *addrType
+    uint64_t       scriptSize
 ) {
-    // default: if we fail to solve the script, we make it pay to unspendable hash 0 (lost coins)
-    memset(pubKeyHash, 0, kSHA256ByteSize);
+    addr.reset();
+
+    if(unlikely(0==scriptSize)) {
+        return -1;
+    }
 
     // The most common output script type that pays to hash160(pubKey)
     if(
@@ -440,9 +479,11 @@ int solveOutputScript(
               25==scriptSize
         )
     ) {
-        memcpy(pubKeyHash, 3+script, kRIPEMD160ByteSize);
-        addrType[0] = 0;
-        return 0;
+        addr.type = 0;
+        addr.addrType = 0;
+        addr.programLen = kRIPEMD160ByteSize;
+        memcpy(addr.program.data(), 3+script, kRIPEMD160ByteSize);
+        return addr.type;
     }
 
     // Output script commonly found in block reward TX, that pays to an explicit pubKey
@@ -455,12 +496,14 @@ int solveOutputScript(
     ) {
         uint256_t sha;
         sha256(sha.v, 1+script, 65);
-        rmd160(pubKeyHash, sha.v, kSHA256ByteSize);
-        addrType[0] = 0;
-        return 1;
+        rmd160(addr.program.data(), sha.v, kSHA256ByteSize);
+        addr.type = 1;
+        addr.addrType = 0;
+        addr.programLen = kRIPEMD160ByteSize;
+        return addr.type;
     }
 
-    // A rather unusual output script that pays to and explicit compressed pubKey
+    // A rather unusual output script that pays to explicit compressed pubKey
     if(
         likely(
               33==script[0]            &&  // OP_PUSHDATA(33)
@@ -468,15 +511,13 @@ int solveOutputScript(
               35==scriptSize
         )
     ) {
-        //uint8_t pubKey[65];
-        //bool ok = decompressPublicKey(pubKey, 1+script);
-        //if(!ok) return -3;
-
         uint256_t sha;
         sha256(sha.v, 1+script, 33);
-        rmd160(pubKeyHash, sha.v, kSHA256ByteSize);
-        addrType[0] = 0;
-        return 2;
+        rmd160(addr.program.data(), sha.v, kSHA256ByteSize);
+        addr.type = 2;
+        addr.addrType = 0;
+        addr.programLen = kRIPEMD160ByteSize;
+        return addr.type;
     }
 
     // A modern output script type, that pays to hash160(script)
@@ -488,9 +529,11 @@ int solveOutputScript(
               23==scriptSize
         )
     ) {
-        memcpy(pubKeyHash, 2+script, kRIPEMD160ByteSize);
-        addrType[0] = 5;
-        return 3;
+        addr.type = 3;
+        addr.addrType = 5;
+        addr.programLen = kRIPEMD160ByteSize;
+        memcpy(addr.program.data(), 2+script, kRIPEMD160ByteSize);
+        return addr.type;
     }
 
     int m = 0;
@@ -505,9 +548,46 @@ int solveOutputScript(
             scriptSize
         )
     ) {
-        packMultiSig(pubKeyHash, addresses, m, n);
-        addrType[0] = 8;
-        return 4;
+        addr.type = 4;
+        addr.addrType = 8;
+        addr.programLen = kRIPEMD160ByteSize;
+        packMultiSig(addr.program.data(), addresses, m, n);
+        return addr.type;
+    }
+
+    // Witness program: OP_n <program>
+    if(scriptSize >= 4 && scriptSize <= 42) {
+        uint8_t version = 0xff;
+        if(0x00 == script[0]) {
+            version = 0;
+        } else if(0x51 <= script[0] && script[0] <= 0x60) {
+            version = script[0] - 0x50;
+        }
+
+        if(version != 0xff) {
+            uint8_t programLen = script[1];
+            if(programLen + 2 == scriptSize && programLen >= 2 && programLen <= 40) {
+                if(version == 0 && !(programLen == 20 || programLen == 32)) {
+                    // invalid witness v0 length
+                    return -1;
+                }
+
+                addr.addrType = 0x80 | version;
+                addr.programLen = programLen;
+                memcpy(addr.program.data(), script + 2, programLen);
+
+                if(version == 0 && programLen == 20) {
+                    addr.type = 5; // P2WPKH
+                } else if(version == 0 && programLen == 32) {
+                    addr.type = 6; // P2WSH
+                } else if(version == 1 && programLen == 32) {
+                    addr.type = 7; // Taproot
+                } else {
+                    addr.type = 8; // Generic witness program
+                }
+                return addr.type;
+            }
+        }
     }
 
     // Broken output scripts that were created by p2pool for a while
@@ -538,17 +618,6 @@ int solveOutputScript(
         return -4;
     }
 
-#if 0
-    // TODO : some scripts are solved by satoshi's client and not by the above. track them
-    // Unknown output script type -- very likely lost coins, but hit the satoshi script solver to make sure
-    int result = extractAddress(pubKeyHash, script, scriptSize);
-    if(result) return -1;
-    return 5;
-    printf("EXOTIC OUTPUT SCRIPT:\n");
-    showScript(script, scriptSize);
-#endif
-
-    // Something we didn't understand
     return -1;
 }
 
@@ -825,43 +894,418 @@ void hash160ToAddr(
     }
 }
 
-bool guessHash160(
-          uint8_t *hash160,
-    const uint8_t *addr,
-             bool verbose
-) {
-    const uint8_t *p = addr;
-    while(1) {
-        uint8_t c = *p;
-        uint8_t h = fromHexDigit(c, false);
-        if(0xff==h) {
-            break;
+static const char kBech32Charset[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+static uint32_t bech32Polymod(const std::vector<uint8_t> &values)
+{
+    static const uint32_t generators[5] = {
+        0x3b6a57b2,
+        0x26508e6d,
+        0x1ea119fa,
+        0x3d4233dd,
+        0x2a1462b3
+    };
+
+    uint32_t chk = 1;
+    for(uint8_t value : values) {
+        uint8_t top = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ value;
+        for(int i = 0; i < 5; ++i) {
+            if((top >> i) & 1) {
+                chk ^= generators[i];
+            }
         }
-        ++p;
+    }
+    return chk;
+}
+
+static void bech32HrpExpand(const std::string &hrp, std::vector<uint8_t> &out)
+{
+    out.clear();
+    out.reserve(hrp.size() * 2 + 1);
+    for(char c : hrp) {
+        out.push_back(static_cast<uint8_t>(c >> 5));
+    }
+    out.push_back(0);
+    for(char c : hrp) {
+        out.push_back(static_cast<uint8_t>(c & 31));
+    }
+}
+
+static std::vector<uint8_t> bech32CreateChecksum(
+    const std::string &hrp,
+    const std::vector<uint8_t> &values,
+    bool bech32m
+)
+{
+    std::vector<uint8_t> hrpExpand;
+    bech32HrpExpand(hrp, hrpExpand);
+
+    std::vector<uint8_t> combined = hrpExpand;
+    combined.reserve(hrpExpand.size() + values.size() + 6);
+    combined.insert(combined.end(), values.begin(), values.end());
+    combined.insert(combined.end(), 6, 0);
+
+    uint32_t polymod = bech32Polymod(combined) ^ (bech32m ? 0x2bc830a3 : 1);
+
+    std::vector<uint8_t> checksum(6);
+    for(size_t i = 0; i < 6; ++i) {
+        checksum[i] = (polymod >> (5 * (5 - i))) & 31;
+    }
+    return checksum;
+}
+
+static bool convertBits(
+    std::vector<uint8_t> &out,
+    const std::vector<uint8_t> &in,
+    int fromBits,
+    int toBits,
+    bool pad
+) {
+    int acc = 0;
+    int bits = 0;
+    const int maxv = (1 << toBits) - 1;
+    const int maxAcc = (1 << (fromBits + toBits - 1)) - 1;
+    out.clear();
+    for(uint8_t value : in) {
+        if((value >> fromBits)) {
+            return false;
+        }
+        acc = ((acc << fromBits) | value) & maxAcc;
+        bits += fromBits;
+        while(bits >= toBits) {
+            bits -= toBits;
+            out.push_back((acc >> bits) & maxv);
+        }
+    }
+    if(pad) {
+        if(bits) {
+            out.push_back((acc << (toBits - bits)) & maxv);
+        }
+    } else {
+        if(bits >= fromBits) {
+            return false;
+        }
+        if(((acc << (toBits - bits)) & maxv)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int bech32CharValue(char c)
+{
+    const char *p = strchr(kBech32Charset, c);
+    if(!p) {
+        return -1;
+    }
+    return p - kBech32Charset;
+}
+
+static bool decodeBech32(
+    const std::string &input,
+    std::string &hrp,
+    std::vector<uint8_t> &data,
+    bool &isBech32m
+) {
+    if(input.size() < 8 || input.size() > 90) {
+        return false;
     }
 
-    ptrdiff_t size = p - addr;
-    if(2*kRIPEMD160ByteSize==size) {
-        fromHex(hash160, addr, kRIPEMD160ByteSize, false);
+    bool hasLower = false;
+    bool hasUpper = false;
+    for(char c : input) {
+        if(c >= 'a' && c <= 'z') hasLower = true;
+        if(c >= 'A' && c <= 'Z') hasUpper = true;
+        if(c < 33 || c > 126) {
+            return false;
+        }
+    }
+    if(hasLower && hasUpper) {
+        return false;
+    }
+
+    std::string copy = input;
+    std::transform(copy.begin(), copy.end(), copy.begin(), ::tolower);
+    auto pos = copy.rfind('1');
+    if(pos == std::string::npos || pos < 1 || pos + 7 > copy.size()) {
+        return false;
+    }
+
+    hrp = copy.substr(0, pos);
+    data.clear();
+    data.reserve(copy.size() - pos - 1);
+    for(size_t i = pos + 1; i < copy.size(); ++i) {
+        int v = bech32CharValue(copy[i]);
+        if(v < 0) {
+            return false;
+        }
+        data.push_back(static_cast<uint8_t>(v));
+    }
+
+    if(data.size() < 6) {
+        return false;
+    }
+
+    std::vector<uint8_t> hrpExpand;
+    bech32HrpExpand(hrp, hrpExpand);
+
+    std::vector<uint8_t> values = hrpExpand;
+    values.insert(values.end(), data.begin(), data.end());
+
+    uint32_t polymod = bech32Polymod(values);
+    if(polymod == 1) {
+        isBech32m = false;
+    } else if(polymod == 0x2bc830a3) {
+        isBech32m = true;
+    } else {
+        return false;
+    }
+
+    data.resize(data.size() - 6);
+    return true;
+}
+
+static const char *getWitnessHRP()
+{
+#if defined(BITCOIN)
+    return "bc";
+#elif defined(TESTNET3)
+    return "tb";
+#else
+    return "";
+#endif
+}
+
+static bool encodeWitnessAddress(const ScriptAddress &addr, std::string &output)
+{
+    if((addr.addrType & 0x80) == 0) {
+        return false;
+    }
+
+    const char *hrpC = getWitnessHRP();
+    if(!hrpC[0]) {
+        return false;
+    }
+    std::string hrp(hrpC);
+
+    uint8_t version = addr.addrType & 0x7f;
+    if(version > 16) {
+        return false;
+    }
+
+    if(addr.programLen < 2 || addr.programLen > 40) {
+        return false;
+    }
+    if(version == 0 && !(addr.programLen == 20 || addr.programLen == 32)) {
+        return false;
+    }
+
+    std::vector<uint8_t> program(addr.program.begin(), addr.program.begin() + addr.programLen);
+    std::vector<uint8_t> converted;
+    if(!convertBits(converted, program, 8, 5, true)) {
+        return false;
+    }
+
+    std::vector<uint8_t> payload;
+    payload.reserve(1 + converted.size());
+    payload.push_back(version);
+    payload.insert(payload.end(), converted.begin(), converted.end());
+
+    bool bech32m = (version > 0);
+    std::vector<uint8_t> checksum = bech32CreateChecksum(hrp, payload, bech32m);
+    payload.insert(payload.end(), checksum.begin(), checksum.end());
+
+    output.assign(hrp);
+    output.push_back('1');
+    for(uint8_t v : payload) {
+        if(v >= 32) {
+            return false;
+        }
+        output.push_back(kBech32Charset[v]);
+    }
+    return true;
+}
+
+static bool decodeWitnessAddress(
+    const std::string &input,
+    ScriptAddressKey &key
+) {
+    std::string hrp;
+    std::vector<uint8_t> data;
+    bool bech32m = false;
+    if(!decodeBech32(input, hrp, data, bech32m)) {
+        return false;
+    }
+
+    const char *expected = getWitnessHRP();
+    if(!expected[0] || hrp != expected) {
+        return false;
+    }
+
+    if(data.empty() || data[0] > 16) {
+        return false;
+    }
+    uint8_t version = data[0];
+    std::vector<uint8_t> program5(data.begin() + 1, data.end());
+    std::vector<uint8_t> program8;
+    if(!convertBits(program8, program5, 5, 8, false)) {
+        return false;
+    }
+    if(program8.size() < 2 || program8.size() > 40) {
+        return false;
+    }
+    if(version == 0 && !(program8.size() == 20 || program8.size() == 32)) {
+        return false;
+    }
+    if(version == 0 && bech32m) {
+        return false;
+    }
+    if(version > 0 && !bech32m) {
+        return false;
+    }
+
+    key.program.fill(0);
+    key.programLen = static_cast<uint8_t>(program8.size());
+    for(size_t i = 0; i < program8.size(); ++i) {
+        key.program[i] = program8[i];
+    }
+    key.addrType = 0x80 | version;
+    if(version == 0 && program8.size() == 20) {
+        key.type = 5;
+    } else if(version == 0 && program8.size() == 32) {
+        key.type = 6;
+    } else if(version == 1 && program8.size() == 32) {
+        key.type = 7;
+    } else {
+        key.type = 8;
+    }
+    return true;
+}
+
+static bool decodeBase58Check(
+    const std::string &input,
+    std::vector<uint8_t> &decoded
+) {
+    decoded.clear();
+    decoded.reserve(input.size());
+
+    std::vector<uint8_t> tmp;
+    tmp.reserve(input.size());
+
+    for(char c : input) {
+        uint8_t value = fromB58Digit(static_cast<uint8_t>(c), false);
+        if(value == 0xff) {
+            return false;
+        }
+        int carry = value;
+        for(size_t j = 0; j < tmp.size(); ++j) {
+            int x = tmp[j] * 58 + carry;
+            tmp[j] = x & 0xff;
+            carry = x >> 8;
+        }
+        while(carry > 0) {
+            tmp.push_back(carry & 0xff);
+            carry >>= 8;
+        }
+    }
+
+    int leading = 0;
+    for(char c : input) {
+        if(c == '1') {
+            ++leading;
+        } else {
+            break;
+        }
+    }
+
+    decoded.assign(leading, 0);
+    for(auto it = tmp.rbegin(); it != tmp.rend(); ++it) {
+        decoded.push_back(*it);
+    }
+
+    if(decoded.size() < 4) {
+        return false;
+    }
+
+    uint8_t check[kSHA256ByteSize];
+    sha256Twice(check, &decoded[0], decoded.size() - 4);
+    if(
+        check[0] != decoded[decoded.size()-4] ||
+        check[1] != decoded[decoded.size()-3] ||
+        check[2] != decoded[decoded.size()-2] ||
+        check[3] != decoded[decoded.size()-1]
+    ) {
+        return false;
+    }
+
+    decoded.resize(decoded.size() - 4);
+    return true;
+}
+
+static bool decodeLegacyAddress(
+    const std::string &input,
+    ScriptAddressKey &key
+) {
+    std::vector<uint8_t> decoded;
+    if(!decodeBase58Check(input, decoded)) {
+        return false;
+    }
+    if(decoded.size() != (1 + kRIPEMD160ByteSize)) {
+        return false;
+    }
+
+    uint8_t version = decoded[0];
+    key.program.fill(0);
+    key.programLen = kRIPEMD160ByteSize;
+    memcpy(key.program.data(), &decoded[1], kRIPEMD160ByteSize);
+    key.addrType = version - getCoinType();
+    if(key.addrType == 5) {
+        key.type = 3;
+    } else {
+        key.type = 0;
+    }
+    return true;
+}
+
+static bool parseAddressString(
+    const std::string &input,
+    ScriptAddressKey &key,
+    bool verbose
+) {
+    std::string trimmed = input;
+    while(!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+        trimmed.pop_back();
+    }
+
+    if(trimmed.size() == 2 * kRIPEMD160ByteSize) {
+        uint8_t hash[kRIPEMD160ByteSize];
+        if(fromHex(hash, reinterpret_cast<const uint8_t*>(trimmed.c_str()), kRIPEMD160ByteSize, false, false)) {
+            key.program.fill(0);
+            key.programLen = kRIPEMD160ByteSize;
+            memcpy(key.program.data(), hash, kRIPEMD160ByteSize);
+            key.addrType = 0;
+            key.type = 0;
+            return true;
+        }
+    }
+
+    if(decodeWitnessAddress(trimmed, key)) {
         return true;
     }
 
-    return addrToHash160(hash160, addr, true, verbose);
-}
+    if(decodeLegacyAddress(trimmed, key)) {
+        return true;
+    }
 
-static bool addAddr(
-    std::vector<uint160_t> &result,
-    const uint8_t *buf,
-    bool verbose
-) {
-    uint160_t h160;
-    bool ok = guessHash160(h160.v, buf, verbose);
-    if(ok) result.push_back(h160);
-    return ok;
+    if(verbose) {
+        warning("%s is not a recognized address", trimmed.c_str());
+    }
+    return false;
 }
 
 void loadKeyList(
-    std::vector<uint160_t> &result,
+    std::vector<ScriptAddressKey> &result,
     const char *str,
     bool verbose
 ) {
@@ -873,7 +1317,10 @@ void loadKeyList(
         ':'==str[4]
     );
     if(!isFile) {
-        addAddr(result, (uint8_t*)str, true);
+        ScriptAddressKey key;
+        if(parseAddressString(str, key, true)) {
+            result.push_back(key);
+        }
         return;
     }
 
@@ -896,21 +1343,13 @@ void loadKeyList(
         ++lineCount;
 
         size_t sz = strlen(buf);
-        if('\n'==buf[sz-1]) buf[sz-1] = 0;
+        if(0 < sz && '\n'==buf[sz-1]) buf[sz-1] = 0;
 
-        uint160_t h160;
-        bool ok = addAddr(result, (uint8_t*)buf, verbose);
+        ScriptAddressKey key;
+        bool ok = parseAddressString(buf, key, verbose);
         if(ok) {
+            result.push_back(key);
             ++found;
-        } else {
-            if(verbose) {
-                warning(
-                    "in file %s, line %d, %s is not an address\n",
-                    fileName,
-                    lineCount,
-                    buf
-                );
-            }
         }
     }
     fclose(f);
@@ -1003,20 +1442,68 @@ std::string pr128(
     return std::string(p[0]!='0' ? p : (1022+result==p) ? p : p+1);
 }
 
-void showFullAddr(
-    const Hash160 &addr,
-    bool both
-) {
-    uint8_t b58[128];
-    if(both) {
-        showHex(addr, sizeof(uint160_t), false);
+std::string formatAddress(const ScriptAddress &addr, bool pad)
+{
+    if(!addr.valid()) {
+        return std::string();
     }
 
-    hash160ToAddr(b58, addr);
-    printf(
-        "%s%s",
-        both ? " " : "", b58
-    );
+    if((addr.addrType & 0x80) == 0 && addr.programLen == kRIPEMD160ByteSize) {
+        uint8_t buffer[128];
+        hash160ToAddr(buffer, addr.program.data(), pad, addr.addrType);
+        return std::string(reinterpret_cast<char*>(buffer));
+    }
+
+    if(addr.addrType & 0x80) {
+        std::string bech32;
+        if(encodeWitnessAddress(addr, bech32)) {
+            if(pad) {
+                const size_t minWidth = std::max<size_t>(bech32.size(), 34);
+                if(bech32.size() < minWidth) {
+                    bech32.append(minWidth - bech32.size(), ' ');
+                }
+            }
+            return bech32;
+        }
+    }
+
+    uint8_t hexBuf[2 * kSHA256ByteSize + 1];
+    toHex(hexBuf, addr.program.data(), addr.programLen, false);
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "script[%u]:%s", addr.type, hexBuf);
+
+    std::string formatted(tmp);
+    if(pad) {
+        const size_t minWidth = 34;
+        if(formatted.size() < minWidth) {
+            formatted.append(minWidth - formatted.size(), ' ');
+        }
+    }
+    return formatted;
+}
+
+void showFullAddr(
+    const ScriptAddress &addr,
+    bool both
+) {
+    if(!addr.valid()) {
+        if(both) {
+            printf("(invalid)");
+        }
+        return;
+    }
+
+    uint8_t hexBuf[2 * kSHA256ByteSize + 1];
+    if(both) {
+        toHex(hexBuf, addr.program.data(), addr.programLen, false);
+        printf("%s", hexBuf);
+    }
+
+    auto formatted = formatAddress(addr, false);
+    if(!formatted.empty()) {
+        printf("%s%s", both ? " " : "", formatted.c_str());
+    }
 }
 
 uint64_t getBaseReward(

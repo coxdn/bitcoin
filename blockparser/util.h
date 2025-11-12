@@ -1,6 +1,7 @@
 #ifndef __UTIL_H__
     #define __UTIL_H__
 
+    #include <array>
     #include <string>
     #include <vector>
     #include <time.h>
@@ -25,6 +26,48 @@
     typedef const uint8_t *Hash256;
     struct uint160_t { uint8_t v[kRIPEMD160ByteSize]; };
     struct uint256_t { uint8_t v[   kSHA256ByteSize]; };
+
+    struct ScriptAddress {
+        int16_t type;
+        uint8_t addrType;
+        uint8_t programLen;
+        std::array<uint8_t, kSHA256ByteSize> program;
+
+        ScriptAddress() { reset(); }
+
+        void reset() {
+            type = -1;
+            addrType = 0;
+            programLen = 0;
+            program.fill(0);
+        }
+
+        bool valid() const { return (type >= 0) && (programLen > 0); }
+    };
+
+    struct ScriptAddressKey {
+        uint8_t type;
+        uint8_t addrType;
+        uint8_t programLen;
+        std::array<uint8_t, kSHA256ByteSize> program;
+
+        bool operator==(const ScriptAddressKey &other) const {
+            if(type != other.type) return false;
+            if(addrType != other.addrType) return false;
+            if(programLen != other.programLen) return false;
+            for(uint8_t i = 0; i < programLen; ++i) {
+                if(program[i] != other.program[i]) return false;
+            }
+            return true;
+        }
+    };
+
+    struct ScriptAddressKeyHasher {
+        size_t operator()(const ScriptAddressKey &key) const;
+    };
+
+    ScriptAddressKey makeScriptAddressKey(const ScriptAddress &addr);
+    ScriptAddress scriptAddressFromKey(const ScriptAddressKey &key);
     struct Hash160Hasher { uint64_t operator()( const Hash160 &hash160) const { uintptr_t i = reinterpret_cast<uintptr_t>(hash160); const uint64_t *p = reinterpret_cast<const uint64_t*>(i); return p[0]; } };
     struct Hash256Hasher { uint64_t operator()( const Hash256 &hash256) const { uintptr_t i = reinterpret_cast<uintptr_t>(hash256); const uint64_t *p = reinterpret_cast<const uint64_t*>(i); return p[0]; } };
 
@@ -147,6 +190,10 @@
         }
     };
 
+    struct ChainWork {
+        uint64_t words[4];
+    };
+
     struct Block {
 
         Chunk         *chunk;
@@ -155,6 +202,13 @@
         Block         *prev;
         Block         *next;
         uint32_t      time;
+        uint32_t      bits;
+        int32_t       version;
+        bool          headerValidated;
+        bool          contextValidated;
+        bool          versionValidated;
+        bool          invalid;
+        ChainWork     chainWork;
 
         void init(
             const uint8_t   *_hash,
@@ -162,7 +216,9 @@
             size_t          _size,
             Block           *_prev,
             uint64_t        _offset,
-            uint32_t        _time
+            uint32_t        _time,
+            uint32_t        _bits,
+            int32_t         _version
         ) {
             chunk = Chunk::alloc();
             chunk->init(_blockFile, _size, _offset);
@@ -172,6 +228,15 @@
             prev = _prev;
             next = 0;
             time = _time;
+            bits = _bits;
+            version = _version;
+            headerValidated = false;
+            contextValidated = false;
+            versionValidated = false;
+            invalid = false;
+            for(int i = 0; i < 4; ++i) {
+                chainWork.words[i] = 0;
+            }
         }
 
         static Block *alloc() {
@@ -419,18 +484,13 @@
                  bool verbose = true
     );
 
-    bool guessHash160(
-              uint8_t *hash160,
-        const uint8_t *addr
-    );
-
     const uint8_t *loadKeyHash(
         const uint8_t *hexHash = 0,
         bool verbose = false
     );
 
     void loadKeyList(
-        std::vector<uint160_t> &result,
+        std::vector<ScriptAddressKey> &result,
         const char *str,
         bool verbose = false
     );
@@ -445,8 +505,10 @@
         const uint128_t &y
     );
 
+    std::string formatAddress(const ScriptAddress &addr, bool pad = false);
+
     void showFullAddr(
-        const Hash160 &addr,
+        const ScriptAddress &addr,
         bool both = false
     );
 
