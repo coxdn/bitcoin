@@ -46,14 +46,18 @@
     };
 
     struct ScriptAddressKey {
+###<<<<<<< codex/locate-files-for-blk-processing-and-validation-7l8uwa
         static constexpr uint8_t UNKNOWN = 0xff;
 
+###=======
+###>>>>>>> master
         uint8_t type;
         uint8_t addrType;
         uint8_t programLen;
         std::array<uint8_t, kSHA256ByteSize> program;
 
         bool operator==(const ScriptAddressKey &other) const {
+###<<<<<<< codex/locate-files-for-blk-processing-and-validation-7l8uwa
             if(programLen != other.programLen) return false;
 
             if(type != UNKNOWN && other.type != UNKNOWN && type != other.type) {
@@ -64,6 +68,11 @@
                 return false;
             }
 
+###=======
+            if(type != other.type) return false;
+            if(addrType != other.addrType) return false;
+            if(programLen != other.programLen) return false;
+###>>>>>>> master
             for(uint8_t i = 0; i < programLen; ++i) {
                 if(program[i] != other.program[i]) return false;
             }

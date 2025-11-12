@@ -9,7 +9,10 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#### codex/locate-files-for-blk-processing-and-validation-7l8uwa
 #include <cstring>
+###
+### master
 #include <inttypes.h>
 #include <fcntl.h>
 #include <malloc.h>
@@ -1328,8 +1331,13 @@ static void buildBlockHeaders() {
             LOAD(uint32_t, rawTime, timePtr);
             uint32_t blockTime = rawTime;
             const uint8_t *bitsPtr = timePtr + 4;
+## codex/locate-files-for-blk-processing-and-validation-7l8uwa
             uint32_t blockBits;
             memcpy(&blockBits, bitsPtr, sizeof(blockBits));
+##
+            uint32_t blockBits = 0;
+            LOAD(uint32_t, blockBits, bitsPtr);
+## master
 
             if(gUseTimeLimit && ((int64_t)blockTime > gTimeLimit)) {
                 auto cur = lseek(blockFile.fd, 0, SEEK_CUR);
