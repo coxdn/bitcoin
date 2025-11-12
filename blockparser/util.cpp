@@ -43,13 +43,13 @@ template<> uint8_t *PagedAllocator<Chunk>::poolEnd = 0;
 
 size_t ScriptAddressKeyHasher::operator()(const ScriptAddressKey &key) const
 {
-### codex/locate-files-for-blk-processing-and-validation-7l8uwa
     uint64_t hash = key.programLen;
-###
-    uint64_t hash = (uint64_t)key.type;
-    hash = (hash << 8) ^ key.addrType;
-    hash = (hash << 8) ^ key.programLen;
-### master
+    if(key.type != ScriptAddressKey::UNKNOWN) {
+        hash = (hash << 8) ^ key.type;
+    }
+    if(key.addrType != ScriptAddressKey::UNKNOWN) {
+        hash = (hash << 8) ^ key.addrType;
+    }
     for(uint8_t i = 0; i < key.programLen; ++i) {
         hash = (hash * 1315423911u) ^ key.program[i];
     }
@@ -72,11 +72,7 @@ ScriptAddressKey makeScriptAddressKey(const ScriptAddress &addr)
 ScriptAddress scriptAddressFromKey(const ScriptAddressKey &key)
 {
     ScriptAddress addr;
-### codex/locate-files-for-blk-processing-and-validation-7l8uwa
     addr.type = (key.type == ScriptAddressKey::UNKNOWN) ? -1 : key.type;
-###
-    addr.type = (key.type == 0xff) ? -1 : key.type;
-### master
     addr.addrType = key.addrType;
     addr.programLen = key.programLen;
     for(uint8_t i = 0; i < key.programLen && i < addr.program.size(); ++i) {
@@ -1234,7 +1230,6 @@ static bool decodeBase58Check(
 
     if(decoded.size() < 4) {
         return false;
-###<<<<<<< codex/locate-files-for-blk-processing-and-validation-7l8uwa
     }
 
     uint8_t check[kSHA256ByteSize];
@@ -1248,21 +1243,6 @@ static bool decodeBase58Check(
         return false;
     }
 
-###=======
-    }
-
-    uint8_t check[kSHA256ByteSize];
-    sha256Twice(check, &decoded[0], decoded.size() - 4);
-    if(
-        check[0] != decoded[decoded.size()-4] ||
-        check[1] != decoded[decoded.size()-3] ||
-        check[2] != decoded[decoded.size()-2] ||
-        check[3] != decoded[decoded.size()-1]
-    ) {
-        return false;
-    }
-
-###>>>>>>> master
     decoded.resize(decoded.size() - 4);
     return true;
 }
@@ -1302,7 +1282,6 @@ static bool parseAddressString(
         trimmed.pop_back();
     }
 
-### codex/locate-files-for-blk-processing-and-validation-7l8uwa
     if(trimmed.size() == 2 * kRIPEMD160ByteSize || trimmed.size() == 2 * kSHA256ByteSize) {
         const size_t expectedLen = (trimmed.size() == 2 * kRIPEMD160ByteSize)
             ? kRIPEMD160ByteSize
@@ -1316,16 +1295,6 @@ static bool parseAddressString(
             memcpy(key.program.data(), hashBuf, expectedLen);
             key.addrType = ScriptAddressKey::UNKNOWN;
             key.type = ScriptAddressKey::UNKNOWN;
-###
-    if(trimmed.size() == 2 * kRIPEMD160ByteSize) {
-        uint8_t hash[kRIPEMD160ByteSize];
-        if(fromHex(hash, reinterpret_cast<const uint8_t*>(trimmed.c_str()), kRIPEMD160ByteSize, false, false)) {
-            key.program.fill(0);
-            key.programLen = kRIPEMD160ByteSize;
-            memcpy(key.program.data(), hash, kRIPEMD160ByteSize);
-            key.addrType = 0;
-            key.type = 0;
-### master
             return true;
         }
     }
