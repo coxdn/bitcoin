@@ -43,13 +43,9 @@ template<> uint8_t *PagedAllocator<Chunk>::poolEnd = 0;
 
 size_t ScriptAddressKeyHasher::operator()(const ScriptAddressKey &key) const
 {
+    // Hash only on the script program length and bytes so keys that compare equal
+    // under wildcard semantics for type/addrType produce identical hashes.
     uint64_t hash = key.programLen;
-    if(key.type != ScriptAddressKey::UNKNOWN) {
-        hash = (hash << 8) ^ key.type;
-    }
-    if(key.addrType != ScriptAddressKey::UNKNOWN) {
-        hash = (hash << 8) ^ key.addrType;
-    }
     for(uint8_t i = 0; i < key.programLen; ++i) {
         hash = (hash * 1315423911u) ^ key.program[i];
     }
