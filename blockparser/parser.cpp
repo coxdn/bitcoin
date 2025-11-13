@@ -1067,9 +1067,21 @@ static void findBlockParent(
     b->contextValidated = true;
 }
 
+static inline void markBlockInvalid(Block *block, size_t &newlyInvalid) {
+    if(unlikely(0==block)) {
+        return;
+    }
+    if(!block->invalid) {
+        block->invalid = true;
+        ++newlyInvalid;
+    }
+}
+
 static void computeBlockHeight(
     Block  *block,
-    size_t &lateLinks
+    size_t &lateLinks,
+    size_t &newlyLinked,
+    size_t &newlyInvalid
 ) {
 
     if(unlikely(gNullBlock==block)) {
@@ -1115,7 +1127,7 @@ static void computeBlockHeight(
                 childHex,
                 parentHex
             );
-            b->invalid = true;
+            markBlockInvalid(b, newlyInvalid);
             return;
         }
 
@@ -1123,7 +1135,7 @@ static void computeBlockHeight(
             bool missingContext = false;
             if(!validateContextualBlockHeader(b, b->prev, missingContext, true)) {
                 if(!missingContext) {
-                    b->invalid = true;
+                    markBlockInvalid(b, newlyInvalid);
                 }
                 return;
             }
@@ -1156,23 +1168,25 @@ static void computeBlockHeight(
 
         if(unlikely(b->prev->invalid || b->prev->height<0)) {
             if(b->prev->invalid) {
-                b->invalid = true;
+                markBlockInvalid(b, newlyInvalid);
                 continue;
             }
-            computeBlockHeight(b->prev, lateLinks);
+            computeBlockHeight(b->prev, lateLinks, newlyLinked, newlyInvalid);
             if(b->prev->height<0) {
                 continue;
             }
         }
 
         height = b->prev->height;
+        auto prevHeight = b->height;
         b->height = height + 1;
+        bool linkedNow = (prevHeight < 0 && b->height >= 0);
 
         if(!b->contextValidated) {
             bool missingContext = false;
             if(!validateContextualBlockHeader(b, b->prev, missingContext, true)) {
                 if(!missingContext) {
-                    b->invalid = true;
+                    markBlockInvalid(b, newlyInvalid);
                 }
                 b->height = -1;
                 continue;
@@ -1181,11 +1195,15 @@ static void computeBlockHeight(
         }
 
         if(!checkVersionForHeight(b, b->height)) {
-            b->invalid = true;
+            markBlockInvalid(b, newlyInvalid);
             b->height = -1;
             continue;
         }
         b->versionValidated = true;
+
+        if(linkedNow) {
+            ++newlyLinked;
+        }
 
         ChainWork proof = computeBlockProof(b->bits);
         if(likely(0!=b->prev)) {
@@ -1213,12 +1231,111 @@ static void computeBlockHeights() {
     size_t lateLinks = 0;
     size_t initialContextRejects = gRejectedContextHeaders;
     size_t initialVersionRejects = gRejectedVersionHeaders;
+
+    size_t totalBlocks = gBlockMap.size();
+    if(gNullBlock && totalBlocks>0) {
+        --totalBlocks;
+    }
+
+    size_t linkedBlocks = 0;
+    size_t invalidBlocks = 0;
+    for(const auto &pair : gBlockMap) {
+        auto block = pair.second;
+        if(unlikely(block==gNullBlock)) {
+            continue;
+        }
+        if(block->height >= 0) {
+            ++linkedBlocks;
+        }
+        if(block->invalid) {
+            ++invalidBlocks;
+        }
+    }
+
+    const auto startTime = Timer::usecs();
+    auto lastReportTime = startTime;
+    size_t processed = 0;
+    constexpr uint64_t reportIntervalUsec = 250 * 1000; // 250ms
+
     info("pass 2 -- link all blocks ...");
     for(const auto &pair:gBlockMap) {
-        computeBlockHeight(pair.second, lateLinks);
+        auto block = pair.second;
+        size_t newlyLinked = 0;
+        size_t newlyInvalid = 0;
+        computeBlockHeight(block, lateLinks, newlyLinked, newlyInvalid);
+        if(unlikely(block==gNullBlock)) {
+            continue;
+        }
+        linkedBlocks += newlyLinked;
+        invalidBlocks += newlyInvalid;
+        ++processed;
+
+        auto now = Timer::usecs();
+        if(now - lastReportTime >= reportIntervalUsec) {
+            auto elapsedUsec = now - startTime;
+            double elapsedSec = elapsedUsec * 1e-6;
+            double blocksPerSec = (elapsedSec>0.0) ? (processed / elapsedSec) : 0.0;
+            size_t accounted = linkedBlocks + invalidBlocks;
+            if(accounted > totalBlocks) {
+                accounted = totalBlocks;
+            }
+            size_t pending = totalBlocks - accounted;
+            double etaSec = (blocksPerSec>0.0) ? (pending / blocksPerSec) : 0.0;
+            size_t pass2ContextRejects = gRejectedContextHeaders - initialContextRejects;
+            size_t pass2VersionRejects = gRejectedVersionHeaders - initialVersionRejects;
+
+            fprintf(
+                stderr,
+                "pass 2 -- %6zu/%6zu processed, linked=%6zu, invalid=%6zu, pending=%6zu, late=%6zu, ctx=%6zu, ver=%6zu, %.2f blk/s, ETA %.0f s, elapsed %.0f s            \r",
+                processed,
+                totalBlocks,
+                linkedBlocks,
+                invalidBlocks,
+                pending,
+                lateLinks,
+                pass2ContextRejects,
+                pass2VersionRejects,
+                blocksPerSec,
+                etaSec,
+                elapsedSec
+            );
+            fflush(stderr);
+            lastReportTime = now;
+        }
     }
+
+    auto now = Timer::usecs();
+    auto elapsedUsec = now - startTime;
+    double elapsedSec = elapsedUsec * 1e-6;
+    double blocksPerSec = (elapsedSec>0.0) ? (processed / elapsedSec) : 0.0;
+    size_t accounted = linkedBlocks + invalidBlocks;
+    if(accounted > totalBlocks) {
+        accounted = totalBlocks;
+    }
+    size_t pending = totalBlocks - accounted;
+    double etaSec = (blocksPerSec>0.0) ? (pending / blocksPerSec) : 0.0;
     size_t pass2ContextRejects = gRejectedContextHeaders - initialContextRejects;
     size_t pass2VersionRejects = gRejectedVersionHeaders - initialVersionRejects;
+
+    fprintf(
+        stderr,
+        "pass 2 -- %6zu/%6zu processed, linked=%6zu, invalid=%6zu, pending=%6zu, late=%6zu, ctx=%6zu, ver=%6zu, %.2f blk/s, ETA %.0f s, elapsed %.0f s            \r",
+        processed,
+        totalBlocks,
+        linkedBlocks,
+        invalidBlocks,
+        pending,
+        lateLinks,
+        pass2ContextRejects,
+        pass2VersionRejects,
+        blocksPerSec,
+        etaSec,
+        elapsedSec
+    );
+    fprintf(stderr, "\n");
+
+    pass2ContextRejects = gRejectedContextHeaders - initialContextRejects;
+    pass2VersionRejects = gRejectedVersionHeaders - initialVersionRejects;
     info(
         "pass 2 -- done, did %d late links, %zu contextual rejects, %zu version rejects",
         (int)lateLinks,
