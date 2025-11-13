@@ -1167,13 +1167,18 @@ static void computeBlockHeight(
         }
 
         if(unlikely(b->prev->invalid || b->prev->height<0)) {
-            if(b->prev->invalid) {
-                markBlockInvalid(b, newlyInvalid);
-                continue;
-            }
-            computeBlockHeight(b->prev, lateLinks, newlyLinked, newlyInvalid);
-            if(b->prev->height<0) {
-                continue;
+            if(b->prev == gNullBlock) {
+                // The synthetic null block always has height -1; treat it as a
+                // known ancestor so the genesis block can be assigned height 0.
+            } else {
+                if(b->prev->invalid) {
+                    markBlockInvalid(b, newlyInvalid);
+                    continue;
+                }
+                computeBlockHeight(b->prev, lateLinks, newlyLinked, newlyInvalid);
+                if(b->prev->height<0) {
+                    continue;
+                }
             }
         }
 
