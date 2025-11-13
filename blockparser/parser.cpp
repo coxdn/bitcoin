@@ -1327,8 +1327,7 @@ static void buildBlockHeaders() {
             const uint8_t *timePtr = buf + 8 + 4 + 32 + 32;
             LOAD(uint32_t, rawTime, timePtr);
             uint32_t blockTime = rawTime;
-            const uint8_t *bitsPtr = timePtr + 4;
-            LOAD(uint32_t, blockBits, bitsPtr);
+            LOAD(uint32_t, blockBits, timePtr);
 
             if(gUseTimeLimit && ((int64_t)blockTime > gTimeLimit)) {
                 auto cur = lseek(blockFile.fd, 0, SEEK_CUR);
