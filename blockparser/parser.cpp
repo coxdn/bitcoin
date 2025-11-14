@@ -998,11 +998,17 @@ static void initCallback(
     }
 }
 
-static void findBlockParent(
+enum class FindParentResult {
+    Found,
+    MissingContext,
+    MissingParent,
+};
+
+static FindParentResult findBlockParent(
     Block *b
 ) {
     if(unlikely(0==b || b->invalid || !b->headerValidated)) {
-        return;
+        return FindParentResult::MissingParent;
     }
 
     b->prev = 0;
@@ -1050,21 +1056,22 @@ static void findBlockParent(
             static_cast<uint64_t>(b->chunk->getOffset()),
             pHash
         );
-        return;
+        return FindParentResult::MissingParent;
     }
 
     Block *candidate = i->second;
     bool missingContext = false;
     if(!validateContextualBlockHeader(b, candidate, missingContext, true)) {
         if(missingContext) {
-            return;
+            return FindParentResult::MissingContext;
         }
         b->invalid = true;
-        return;
+        return FindParentResult::MissingParent;
     }
 
     b->prev = candidate;
     b->contextValidated = true;
+    return FindParentResult::Found;
 }
 
 static inline void markBlockInvalid(Block *block, size_t &newlyInvalid) {
@@ -1105,12 +1112,25 @@ static void computeBlockHeight(
 
         if(unlikely(0==b->prev)) {
 
-            findBlockParent(b);
+            auto findResult = findBlockParent(b);
             ++lateLinks;
 
-            if(0==b->prev) {
-                warning("failed to locate parent block");
+            if(b->invalid) {
+                markBlockInvalid(b, newlyInvalid);
                 return;
+            }
+
+            switch(findResult) {
+                case FindParentResult::Found:
+                    if(0==b->prev) {
+                        return;
+                    }
+                    break;
+                case FindParentResult::MissingContext:
+                    return;
+                case FindParentResult::MissingParent:
+                    markBlockInvalid(b, newlyInvalid);
+                    return;
             }
         }
 
